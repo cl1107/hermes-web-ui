@@ -1,38 +1,119 @@
 #!/usr/bin/env node
-import { resolve, dirname } from 'path'
+import { createServer as createViteServer } from 'http'
+import { resolve, dirname, join } from 'path'
 import { fileURLToPath } from 'url'
+import { readFile, stat, readdir } from 'fs/promises'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
-const projectRoot = resolve(__dirname, '..')
+const distDir = resolve(__dirname, '..', 'dist')
+const API_TARGET = 'http://127.0.0.1:8642'
+const DEFAULT_PORT = 8648
+
+const MIME_TYPES = {
+  '.html': 'text/html',
+  '.js': 'application/javascript',
+  '.css': 'text/css',
+  '.json': 'application/json',
+  '.png': 'image/png',
+  '.svg': 'image/svg+xml',
+  '.ico': 'image/x-icon',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
+}
+
+function getMimeType(filePath) {
+  const ext = filePath.substring(filePath.lastIndexOf('.'))
+  return MIME_TYPES[ext] || 'application/octet-stream'
+}
+
+async function serveStatic(reqPath, res) {
+  let filePath = join(distDir, reqPath)
+  try {
+    const s = await stat(filePath)
+    if (s.isDirectory()) filePath = join(filePath, 'index.html')
+    const data = await readFile(filePath)
+    res.writeHead(200, {
+      'Content-Type': getMimeType(filePath),
+      'Cache-Control': 'public, max-age=3600',
+    })
+    res.end(data)
+  } catch {
+    // SPA fallback
+    try {
+      const data = await readFile(join(distDir, 'index.html'))
+      res.writeHead(200, { 'Content-Type': 'text/html' })
+      res.end(data)
+    } catch {
+      res.writeHead(404, { 'Content-Type': 'text/plain' })
+      res.end('Not Found')
+    }
+  }
+}
+
+async function proxyRequest(req, res, reqPath) {
+  const url = `${API_TARGET}${reqPath}`
+  const headers = { ...req.headers, host: '127.0.0.1:8642' }
+  delete headers['origin']
+  delete headers['referer']
+
+  try {
+    const apiRes = await fetch(url, {
+      method: req.method,
+      headers,
+      body: req.method !== 'GET' && req.method !== 'HEAD' ? req : undefined,
+    })
+
+    const resHeaders = {}
+    apiRes.headers.forEach((v, k) => {
+      if (k !== 'transfer-encoding' && k !== 'connection') {
+        resHeaders[k] = v
+      }
+    })
+    resHeaders['x-accel-buffering'] = 'no'
+    resHeaders['cache-control'] = 'no-cache'
+
+    res.writeHead(apiRes.status, resHeaders)
+
+    if (apiRes.body) {
+      const reader = apiRes.body.getReader()
+      const pump = async () => {
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+          res.write(value)
+        }
+        res.end()
+      }
+      await pump()
+    } else {
+      res.end()
+    }
+  } catch (err) {
+    if (!res.headersSent) {
+      res.writeHead(502, { 'Content-Type': 'application/json' })
+    }
+    res.end(JSON.stringify({ error: { message: `API proxy error: ${err.message}` } }))
+  }
+}
 
 const command = process.argv[2]
 
-if (!command || command === 'start' || command === 'dev') {
-  const { createServer } = await import('vite')
-  const vue = await import('@vitejs/plugin-vue')
-  const server = await createServer({
-    root: projectRoot,
-    configFile: resolve(projectRoot, 'vite.config.ts'),
-    server: {
-      host: true,
-      port: 8648,
-    },
-    plugins: [vue.default()],
-  })
-  await server.listen()
-  server.printUrls()
-} else if (command === 'build') {
-  const { build } = await import('vite')
-  const vue = await import('@vitejs/plugin-vue')
-  await build({
-    root: projectRoot,
-    configFile: resolve(projectRoot, 'vite.config.ts'),
-    plugins: [vue.default()],
-  })
-} else {
-  console.log('Usage: hermes-web-ui [command]')
-  console.log()
-  console.log('Commands:')
-  console.log('  start    Start dev server (default)')
-  console.log('  build    Build for production')
+if (command === 'build') {
+  console.log('Build is done during npm install. Use "npm run build" in the source repo.')
+  process.exit(1)
 }
+
+// start (default)
+const port = parseInt(process.argv[2] && !isNaN(process.argv[2]) ? process.argv[2] : process.argv.includes('--port') ? process.argv[process.argv.indexOf('--port') + 1] : '') || DEFAULT_PORT
+
+createViteServer(async (req, res) => {
+  const reqPath = req.url.split('?')[0]
+
+  if (reqPath.startsWith('/api/') || reqPath.startsWith('/v1/') || reqPath === '/health' || reqPath.startsWith('/health')) {
+    await proxyRequest(req, res, reqPath)
+  } else {
+    await serveStatic(reqPath, res)
+  }
+}).listen(port, '0.0.0.0', () => {
+  console.log(`  ➜  Hermes Web UI: http://localhost:${port}`)
+})
